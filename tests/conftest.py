@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import os
 import platform
@@ -28,7 +29,7 @@ import warnings
 from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import pytest
 import time_machine
@@ -1335,6 +1336,25 @@ class RecordedWarning(NamedTuple):
     def uniq_key(self):
         return self.category, self.message, self.lineno, self.lineno
 
+    @property
+    def group(self) -> str:
+        """
+        Determine in which type of files warning raises.
+
+        It depends on ``stacklevel`` in ``warnings.warn``, and if it is not set correctly,
+        it might refer to another file.
+        There is an assumption that airflow and all dependencies set it correct eventually.
+        But we should not use it to filter it out, only for show in different groups.
+        """
+        if self.filename.startswith("airflow/"):
+            if self.filename.startswith("airflow/providers/"):
+                return "providers"
+            return "airflow"
+        elif self.filename.startswith("tests/"):
+            return "tests"
+        return "other"
+
+    @property
     def as_dict(self) -> dict:
         return {
             "category": self.category,
@@ -1342,7 +1362,14 @@ class RecordedWarning(NamedTuple):
             "node_id": self.node_id,
             "filename": self.filename,
             "lineno": self.lineno,
+            "group": self.group,
         }
+
+    def dumps(self, *, count: int | None = None) -> str:
+        dump = self.as_dict
+        if count is not None:
+            dump["count"] = count
+        return json.dumps(dump)
 
 
 captured_warnings: dict[RecordedWarning, int] = {}
@@ -1373,12 +1400,17 @@ def pytest_runtest_call(item: pytest.Item):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_terminal_summary(terminalreporter, exitstatus: int, config: pytest.Config):
+    def sorted_groupby(it, grouping_key: Callable):
+        """Helper for sort and group by."""
+        for group, grouped_data in itertools.groupby(sorted(it, key=grouping_key), key=grouping_key):
+            yield group, list(grouped_data)
+
     yield
     if config.option.disable_capture_warnings:
         return
 
     warning_output_path = config.option.warning_output_path
-    if warning_output_path.exists():
+    if warning_output_path.exists():  # Cleanup file.
         warning_output_path.open("w").close()
 
     if not captured_warnings:
@@ -1390,12 +1422,23 @@ def pytest_terminal_summary(terminalreporter, exitstatus: int, config: pytest.Co
         yellow=True,
         bold=True,
     )
-    with warning_output_path.open("w") as f:
+    for group, grouped_data in sorted_groupby(captured_warnings.items(), lambda x: x[0].group):
+        color = {}
+        if group in ("airflow", "providers"):
+            color["red"] = True
+        elif group == "tests":
+            color["yellow"] = True
+        else:
+            color["white"] = True
+        terminalreporter.write(group, bold=True, **color)
+        terminalreporter.write(
+            f": total {sum(item[1] for item in grouped_data)}, "
+            f"unique {len({item[0].uniq_key for item in grouped_data})}\n"
+        )
+
+    with warning_output_path.open("w") as fp:
         for warn, warn_count in captured_warnings.items():
-            record = warn.as_dict()
-            record["count"] = warn_count
-            f.write(json.dumps(record))
-            f.write("\n")
+            fp.write(f"{warn.dumps(count=warn_count)}\n")
     terminalreporter.write("Warnings saved into ")
     terminalreporter.write(os.fspath(warning_output_path), yellow=True)
     terminalreporter.write(" file.\n")
